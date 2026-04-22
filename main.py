@@ -33,6 +33,7 @@ upsampler = RealESRGANer(
 class ImageRequest(BaseModel):
     image_url: str
     box_coordinates: List[int]
+    do_upscale: bool = False # Mặc định là False (không tăng nét) để an toàn
 
 @app.post("/generate-psd-upscale")
 async def generate_psd(req: ImageRequest):
