@@ -7,116 +7,87 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from segment_anything import sam_model_registry, SamPredictor
+from realesrgan import RealESRGANer
+from basicsr.archs.rrdbnet_arch import RRDBNet
 from typing import List
 
-app = FastAPI(title="AI Photoshop Layer Tool")
+app = FastAPI()
 
-# 1. Khởi tạo mô hình AI (SAM) lúc server khởi động
-device = "cpu"
-model_type = "vit_h"
-sam = sam_model_registry[model_type](checkpoint="/models/sam_vit_h_4b8939.pth")
-sam.to(device=device)
+# 1. Khởi tạo SAM
+sam = sam_model_registry["vit_h"](checkpoint="/models/sam_vit_h_4b8939.pth")
+sam.to(device="cpu")
 predictor = SamPredictor(sam)
 
-# 2. Định nghĩa cấu trúc dữ liệu JSON nhận tọa độ và link ảnh
+# 2. Khởi tạo Real-ESRGAN (x2)
+model_upscale = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=2)
+upsampler = RealESRGANer(
+    scale=2,
+    model_path='/models/RealESRGAN_x2plus.pth',
+    model=model_upscale,
+    tile=400, # Chia nhỏ ảnh để tránh tràn RAM
+    tile_pad=10,
+    pre_pad=0,
+    half=False # Chạy trên CPU thì để False
+)
+
 class ImageRequest(BaseModel):
     image_url: str
-    box_coordinates: List[int] # Nhận [x1, y1, x2, y2]
+    box_coordinates: List[int]
 
-def download_image_to_cv2(url: str):
-    response = requests.get(url, timeout=10)
-    if response.status_code != 200:
-        raise ValueError("Không thể tải ảnh từ URL")
-    img_array = np.asarray(bytearray(response.content), dtype=np.uint8)
-    return cv2.imdecode(img_array, cv2.IMREAD_COLOR)
-
-# 3. Endpoint chính để xử lý "Cắt & Vẽ bù" thành PSD
-@app.post("/generate-psd")
+@app.post("/generate-psd-upscale")
 async def generate_psd(req: ImageRequest):
     try:
-        # 3.1 Tải ảnh gốc
-        img = download_image_to_cv2(req.image_url)
+        # Tải ảnh
+        resp = requests.get(req.image_url)
+        img = cv2.imdecode(np.frombuffer(resp.content, np.uint8), cv2.IMREAD_COLOR)
         h, w, _ = img.shape
-        # SAM expects RGB input
-        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         
-        # 3.2 Tách mặt nạ (Mask) vật thể dựa trên tọa độ khoanh vùng
-        predictor.set_image(img_rgb)
-        input_box = np.array(req.box_coordinates)
-        
-        masks, scores, logits = predictor.predict(
-            box=input_box[None, :],
-            multimask_output=False,
-        )
-        
-        if len(masks) == 0:
-            raise HTTPException(status_code=400, detail="Không tìm thấy vật thể nào trong vùng khoanh.")
-            
+        # Tách Mask
+        predictor.set_image(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+        masks, _, _ = predictor.predict(box=np.array(req.box_coordinates)[None, :], multimask_output=False)
         mask = masks[0]
-        
-        # 3.3 Trích xuất đối tượng (PNG dải trong suốt)
-        # Tạo mask chi tiết (Dilation) để khi vẽ bù không bị lem viền
-        kernel = np.ones((15, 15), np.uint8)
-        dilated_mask = cv2.dilate(mask.astype(np.uint8), kernel, iterations=1)
-        
-        # Tách kênh alpha (trong suốt)
+
+        # --- XỬ LÝ VẬT THỂ (Layer 1) ---
         mask_uint8 = (mask * 255).astype(np.uint8)
+        fg = cv2.merge([img[:,:,0], img[:,:,1], img[:,:,2], mask_uint8])
         
-        b, g, r = cv2.split(img)
-        rgba = [b, g, r, mask_uint8]
-        foreground_cv2 = cv2.merge(rgba)
+        # Tăng nét vật thể x2
+        # Tách RGB và Alpha để tăng nét riêng (Real-ESRGAN không hỗ trợ Alpha trực tiếp tốt)
+        fg_rgb = fg[:,:,:3]
+        fg_alpha = fg[:,:,3]
         
-        # 3.4 Chạy AI Inpainting (Vẽ bù nền thông minh)
-        # Inpainting in OpenCV is basic, for professional result update to LaMa or other model
-        mask_for_inpaint = (dilated_mask * 255).astype(np.uint8)
-        background_inpainted_cv2 = cv2.inpaint(img, mask_for_inpaint, 3, cv2.INPAINT_TELEA)
+        upscaled_fg_rgb, _ = upsampler.enhance(fg_rgb, outscale=2)
+        upscaled_fg_alpha = cv2.resize(fg_alpha, (w*2, h*2), interpolation=cv2.INTER_LANCZOS4)
         
-        # 3.5 Đóng gói thành file .psd (Photoshop)
-        document = pytoshop.Document(width=w, height=h)
+        # --- XỬ LÝ NỀN (Layer 2) ---
+        mask_inpaint = cv2.dilate(mask_uint8, np.ones((15,15), np.uint8), iterations=1)
+        bg_inpainted = cv2.inpaint(img, mask_inpaint, 3, cv2.INPAINT_TELEA)
+        # Nền cũng phải x2 để khớp kích thước file PSD
+        bg_upscaled = cv2.resize(bg_inpainted, (w*2, h*2), interpolation=cv2.INTER_LANCZOS4)
+
+        # Đóng gói PSD
+        document = pytoshop.Document(width=w*2, height=h*2)
         
-        # Tạo Layer Nền (phía dưới)
-        bg_rgb = cv2.cvtColor(background_inpainted_cv2, cv2.COLOR_BGR2RGB)
-        bg_layer_rec = pytoshop.LayerRecord(
-             channels = [
-                 pytoshop.LayerChannel(pytoshop.ColorId.RED, bg_rgb[:,:,0]),
-                 pytoshop.LayerChannel(pytoshop.ColorId.GREEN, bg_rgb[:,:,1]),
-                 pytoshop.LayerChannel(pytoshop.ColorId.BLUE, bg_rgb[:,:,2]),
-             ],
-             top=0, left=0, bottom=h, right=w,
-             blend_mode=pytoshop.BlendMode.NORMAL,
-             opacity=255,
-             visible=True,
-             name='Layer2_NenHoanChinh'
+        # Add BG
+        bg_layer = pytoshop.LayerRecord(
+            channels={i: bg_upscaled[:,:,2-i] for i in range(3)},
+            top=0, left=0, bottom=h*2, right=w*2, name='Nen_x2'
         )
-        document.layers.append(bg_layer_rec)
+        document.layers.append(bg_layer)
         
-        # Tạo Layer Vật Thể (phía trên)
-        fg_rgb_a = cv2.cvtColor(foreground_cv2, cv2.COLOR_BGRA2RGBA)
-        fg_layer_rec = pytoshop.LayerRecord(
-             channels = [
-                 pytoshop.LayerChannel(pytoshop.ColorId.RED, fg_rgb_a[:,:,0]),
-                 pytoshop.LayerChannel(pytoshop.ColorId.GREEN, fg_rgb_a[:,:,1]),
-                 pytoshop.LayerChannel(pytoshop.ColorId.BLUE, fg_rgb_a[:,:,2]),
-                 pytoshop.LayerChannel(pytoshop.ColorId.ALPHA, fg_rgb_a[:,:,3]),
-             ],
-             top=0, left=0, bottom=h, right=w,
-             blend_mode=pytoshop.BlendMode.NORMAL,
-             opacity=255,
-             visible=True,
-             name='Layer1_VatThe'
+        # Add FG
+        fg_channels = {i: upscaled_fg_rgb[:,:,2-i] for i in range(3)}
+        fg_channels[-1] = upscaled_fg_alpha # Alpha channel
+        fg_layer = pytoshop.LayerRecord(
+            channels=fg_channels,
+            top=0, left=0, bottom=h*2, right=w*2, name='VatThe_Net_x2'
         )
-        document.layers.append(fg_layer_rec)
-        
-        # Viết Document ra file-like object
+        document.layers.append(fg_layer)
+
         psd_buffer = io.BytesIO()
         pytoshop.write(psd_buffer, document)
         psd_buffer.seek(0)
         
-        return StreamingResponse(
-            psd_buffer, 
-            media_type="application/octet-stream", # General application type for PSD
-            headers={"Content-Disposition": "attachment; filename=AI_Separated_Layers.psd"}
-        )
-
+        return StreamingResponse(psd_buffer, media_type="application/octet-stream")
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Lỗi AI: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
